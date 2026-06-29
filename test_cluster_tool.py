@@ -2364,6 +2364,56 @@ class TestGenVmXmlPlatformParams(unittest.TestCase):
         self.assertIn("<emulator>/usr/libexec/qemu-kvm</emulator>", xml)
         self.assertNotIn(ct.DEFAULT_VM_EMULATOR, xml)
         self.assertNotIn(ct.DEFAULT_VM_MACHINE_TYPE, xml)
+class TestRunVmQuoting(unittest.TestCase):
+    def setUp(self):
+        self.env = ct.ExecutionEnv(host="test@host", host_ip="10.0.0.1")
+        self.captured_cmd = None
+
+        def capture_run(cmd, *, check=True):
+            self.captured_cmd = cmd
+            r = MagicMock()
+            r.returncode = 0
+            r.stdout = "test-output"
+            r.stderr = ""
+            return r
+
+        self.env.run = capture_run
+
+    def test_remote_run_vm_preserves_single_quotes(self):
+        cmd = """sudo python3 -c "d=open('/etc/test').read(); print(d['key'])" """
+        self.env.run_vm("192.168.1.10", cmd)
+        self.assertIn("192.168.1.10", self.captured_cmd)
+        self.assertNotIn("'{cmd}'", self.captured_cmd)
+        inner = self.captured_cmd.split("core@192.168.1.10 ", 1)[1]
+        import ast
+        try:
+            reconstructed = ast.literal_eval(inner)
+        except (ValueError, SyntaxError):
+            reconstructed = None
+        self.assertEqual(reconstructed, cmd,
+            "shlex.quote must produce a shell-safe string that reconstructs the original command")
+
+    def test_remote_run_vm_simple_command_works(self):
+        self.env.run_vm("192.168.1.10", "echo hello")
+        self.assertIn("echo hello", self.captured_cmd)
+
+    def test_local_run_vm_passes_cmd_directly(self):
+        local_env = ct.ExecutionEnv(host="local", host_ip="127.0.0.1")
+        captured = {}
+        original_run = subprocess.run
+        def mock_run(*args, **kwargs):
+            captured["args"] = args[0] if args else kwargs.get("args")
+            r = MagicMock()
+            r.returncode = 0
+            r.stdout = ""
+            r.stderr = ""
+            return r
+        with patch("subprocess.run", side_effect=mock_run):
+            local_env.run_vm("192.168.1.10", "sudo python3 -c \"open('/etc/test')\"")
+        self.assertIsInstance(captured["args"], list)
+        self.assertEqual(captured["args"][-1], "sudo python3 -c \"open('/etc/test')\"")
+
+
 class TestPullSecretInjection(unittest.TestCase):
     _INITIAL_STATE = TestTransactionalBoot._INITIAL_STATE
 
@@ -2400,24 +2450,23 @@ class TestPullSecretInjection(unittest.TestCase):
     @patch.object(ct, "remove_dns_entry")
     @patch.object(ct, "remove_haproxy_clone")
     @patch.object(ct, "add_dns_entry")
-    def test_boot_pull_secret_injected_before_crio_start(self, *_):
+    def test_boot_pull_secret_not_written_to_node(self, *_):
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
             json.dump({"auths": {"quay.io": {"auth": "dGVzdA=="}}}, f)
             ps_path = f.name
         try:
             ssh = self.mock_env.wrap_run_positional(self._make_all_succeed_ssh())
             with patch.object(ct.env, "run", side_effect=ssh), \
-                 patch.object(ct.env, "write_file", side_effect=self.mock_env.mock_write_file), \
-                 patch("subprocess.run", return_value=MagicMock(returncode=0)):
+                 patch.object(ct.env, "write_file", side_effect=self.mock_env.mock_write_file):
                 ct.cmd_boot(self._boot_args(pull_secret=ps_path))
 
             cmds = [cmd for cmd, _ in self.calls]
-            ps_copy_idx = next(i for i, c in enumerate(cmds)
-                               if "cp /tmp/pull-secret.json /var/lib/kubelet/config.json" in c)
-            crio_start_idx = next(i for i, c in enumerate(cmds)
-                                  if "systemctl start crio" in c)
-            self.assertLess(ps_copy_idx, crio_start_idx,
-                "pull secret must be injected before CRI-O starts")
+            self.assertFalse(
+                any("cp" in c and "pull-secret" in c and "/var/lib/kubelet/config.json" in c for c in cmds),
+                "pull secret must not be written directly to node — MCO owns that file")
+            self.assertFalse(
+                any("tee /var/lib/kubelet/config.json" in c for c in cmds),
+                "pull secret must not be written directly to node — MCO owns that file")
         finally:
             os.unlink(ps_path)
             ct.KUBECONFIG_DIR.joinpath("aabbccdd.kubeconfig").unlink(missing_ok=True)
@@ -2426,22 +2475,27 @@ class TestPullSecretInjection(unittest.TestCase):
     @patch.object(ct, "remove_dns_entry")
     @patch.object(ct, "remove_haproxy_clone")
     @patch.object(ct, "add_dns_entry")
-    def test_boot_pull_secret_updates_cluster_secret(self, *_):
+    def test_boot_pull_secret_injected_after_health_before_operators(self, *_):
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
             json.dump({"auths": {"quay.io": {"auth": "dGVzdA=="}}}, f)
             ps_path = f.name
         try:
             ssh = self.mock_env.wrap_run_positional(self._make_all_succeed_ssh())
             with patch.object(ct.env, "run", side_effect=ssh), \
-                 patch.object(ct.env, "write_file", side_effect=self.mock_env.mock_write_file), \
-                 patch("subprocess.run", return_value=MagicMock(returncode=0)):
+                 patch.object(ct.env, "write_file", side_effect=self.mock_env.mock_write_file):
                 ct.cmd_boot(self._boot_args(pull_secret=ps_path))
 
             cmds = [cmd for cmd, _ in self.calls]
             oc_set_cmds = [c for c in cmds if "set data secret/pull-secret" in c]
             self.assertEqual(len(oc_set_cmds), 1)
             self.assertIn("openshift-config", oc_set_cmds[0])
-            self.assertIn("/var/lib/kubelet/config.json", oc_set_cmds[0])
+            healthz_idx = next(i for i, c in enumerate(cmds) if "healthz" in c)
+            set_idx = next(i for i, c in enumerate(cmds) if "set data secret/pull-secret" in c)
+            co_idx = next(i for i, c in enumerate(cmds) if "get co -o json" in c)
+            self.assertGreater(set_idx, healthz_idx,
+                "pull secret must be set after API health check")
+            self.assertLess(set_idx, co_idx,
+                "pull secret must be set before operator check")
         finally:
             os.unlink(ps_path)
             ct.KUBECONFIG_DIR.joinpath("aabbccdd.kubeconfig").unlink(missing_ok=True)
