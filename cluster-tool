@@ -1105,8 +1105,8 @@ def cmd_boot(args):
                 if kind == "vm":
                     destroy_vm(target)
                 elif kind == "net":
-                    env.run(f"virsh net-destroy {target}")
-                    env.run(f"virsh net-undefine {target}")
+                    env.run(f"virsh net-destroy {target}", check=False)
+                    env.run(f"virsh net-undefine {target}", check=False)
                 elif kind == "rm":
                     env.run(f"rm -f {target}")
                 elif kind == "kubeconfig":

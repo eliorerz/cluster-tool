@@ -617,6 +617,47 @@ class TestTransactionalBoot(unittest.TestCase):
         self.assertLess(sec_net_destroy_idx, pri_net_destroy_idx)
         self.assertLess(pri_net_destroy_idx, overlay_idx)
 
+    @patch("time.sleep")
+    @patch.object(ct.ExecutionEnv, "write_file")
+    @patch.object(ct, "add_dns_entry")
+    @patch.object(ct.ExecutionEnv, "copy_from")
+    def test_rollback_survives_inactive_primary_network(self, *_):
+        """Primary net-start can fail (e.g. subnet collides with an existing
+        libvirt network), leaving the network defined but never started. The
+        rollback's net-destroy must tolerate that ("network is not active")
+        instead of aborting before later cleanup (like the disk overlay) runs.
+        """
+        def ssh(cmd, check=True):
+            self.calls.append((cmd, check))
+            r = MagicMock()
+            r.returncode = 0
+            r.stdout = ""
+            r.stderr = ""
+            if cmd.startswith("virsh net-start test-infra-net-") and check:
+                raise SystemExit("Simulated: net-start failed (subnet collision)")
+            if "net-destroy test-infra-net-" in cmd and check:
+                raise SystemExit(
+                    f"Command failed (exit 1): {cmd}\n"
+                    "error: Requested operation is not valid: network is not active"
+                )
+            if "bash -c" in cmd and "test -x" in cmd:
+                r.stdout = "/usr/bin/qemu-system-x86_64\n"
+            elif "-machine help" in cmd:
+                r.stdout = "q35 Standard PC (Q35 + ICH9, 2009)\n"
+            return r
+
+        wrapped = self.mock_env.wrap_run_positional(ssh)
+        with patch.object(ct.env, "run", side_effect=wrapped):
+            with self.assertRaises(SystemExit):
+                ct.cmd_boot(self._boot_args())
+
+        cleanup = self._cleanup_cmds()
+        self.assertTrue(any("net-destroy test-infra-net-" in c for c in cleanup))
+        self.assertTrue(any("net-undefine test-infra-net-" in c for c in cleanup))
+        self.assertTrue(any("rm -f" in c and "overlays/aabbccdd" in c for c in cleanup),
+                         "rollback must still clean the disk overlay after the inactive-network net-destroy")
+        self.assertEqual(self.mock_env.get_saved_state()["clones"], {})
+
 
     _MOCK_CO_JSON = json.dumps({"items": [
         {"metadata": {"name": "test"}, "status": {"conditions": [
