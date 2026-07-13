@@ -53,6 +53,35 @@ CLIENT_CONFIG_DIR = _REAL_HOME / ".config" / "cluster-tool"
 CLIENT_SERVERS_FILE = CLIENT_CONFIG_DIR / "servers.json"
 
 
+def _restore_ownership(path):
+    """When invoked via sudo (the normal CI path for boot/destroy/etc.,
+    which need root for libvirt/network operations), any file or
+    directory this process creates or writes is owned by root -- even
+    though _REAL_HOME above correctly points at the invoking user's
+    home. That leaves state.json/state.lock/haproxy.lock/kubeconfigs
+    root-owned after every run, silently breaking the next unprivileged
+    (non-sudo) read/write of the same paths. Chown back to the
+    SUDO_UID/SUDO_GID sudo records for the real invoking user whenever
+    we're running as root under sudo; a no-op otherwise (e.g. local,
+    non-CI use without sudo).
+
+    Fails loudly (sys.exit), matching this codebase's convention, rather
+    than warning and continuing -- a silently-swallowed chown failure
+    would let the exact bug this exists to fix (root-owned state files
+    silently breaking the next run) reappear with no CI signal at all.
+    """
+    if os.geteuid() != 0:
+        return
+    sudo_uid = os.environ.get("SUDO_UID")
+    sudo_gid = os.environ.get("SUDO_GID")
+    if sudo_uid is None or sudo_gid is None:
+        return
+    try:
+        os.chown(str(path), int(sudo_uid), int(sudo_gid))
+    except OSError as e:
+        sys.exit(f"Failed to chown {path} to {sudo_uid}:{sudo_gid}: {e}")
+
+
 def load_servers():
     if CLIENT_SERVERS_FILE.exists():
         return json.loads(CLIENT_SERVERS_FILE.read_text())
@@ -61,7 +90,9 @@ def load_servers():
 
 def save_servers(config):
     CLIENT_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    _restore_ownership(CLIENT_CONFIG_DIR)
     CLIENT_SERVERS_FILE.write_text(json.dumps(config, indent=2) + "\n")
+    _restore_ownership(CLIENT_SERVERS_FILE)
 
 
 def resolve_server(name):
@@ -148,7 +179,9 @@ class ExecutionEnv:
         if self.is_local:
             resolved = Path(os.path.expanduser(path))
             resolved.parent.mkdir(parents=True, exist_ok=True)
+            _restore_ownership(resolved.parent)
             resolved.write_text(content)
+            _restore_ownership(resolved)
         else:
             encoded = base64.b64encode(content.encode()).decode()
             self.run(f"echo '{encoded}' | base64 -d > {path}")
@@ -220,8 +253,10 @@ def save_state(state):
 @contextmanager
 def locked_state():
     CLIENT_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    _restore_ownership(CLIENT_CONFIG_DIR)
     lock_path = CLIENT_CONFIG_DIR / "state.lock"
     with open(lock_path, "w") as lock_fd:
+        _restore_ownership(lock_path)
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
         state = load_state()
         yield state
@@ -231,8 +266,10 @@ def locked_state():
 @contextmanager
 def locked_haproxy():
     CLIENT_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    _restore_ownership(CLIENT_CONFIG_DIR)
     lock_path = CLIENT_CONFIG_DIR / "haproxy.lock"
     with open(lock_path, "w") as lock_fd:
+        _restore_ownership(lock_path)
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
         yield
 
@@ -1007,12 +1044,15 @@ def cmd_boot(args):
         print_step(7, total, "Configuring access")
         kubeconfig_path = KUBECONFIG_DIR / f"{clone_id}.kubeconfig"
         KUBECONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        _restore_ownership(KUBECONFIG_DIR)
         r = env.run_vm(vm_ip, "sudo cat /etc/kubernetes/static-pod-resources/kube-apiserver-certs/secrets/node-kubeconfigs/lb-ext.kubeconfig", identity=key_path)
         kubeconfig_path.write_text(r.stdout)
+        _restore_ownership(kubeconfig_path)
 
         kc_content = kubeconfig_path.read_text()
         kc_content = kc_content.replace(f"https://{vm_ip}:6443", f"https://api.{domain}:6443")
         kubeconfig_path.write_text(kc_content)
+        _restore_ownership(kubeconfig_path)
         cleanup.append(("kubeconfig", kubeconfig_path))
 
         add_haproxy_clone(clone_id, subnet)
